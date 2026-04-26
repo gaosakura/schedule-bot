@@ -24,6 +24,35 @@ USER_ACCESS_TOKEN_FILE = "user_access_token.txt"
 USER_REFRESH_TOKEN_FILE = "user_refresh_token.txt"
 
 
+def send_feishu_reply(chat_id: str, message_id: str, content: str):
+    """向用户发送回复消息"""
+    url = "https://open.feishu.cn/open-apis/im/v1/messages"
+    
+    # 获取 tenant_access_token
+    token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    token_data = {"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}
+    token_resp = requests.post(token_url, json=token_data).json()
+    tenant_token = token_resp.get("tenant_access_token")
+    
+    if not tenant_token:
+        print(f"获取tenant_token失败: {token_resp}")
+        return None
+    
+    headers = {"Authorization": f"Bearer {tenant_token}"}
+    
+    payload = {
+        "receive_id": chat_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": content})
+    }
+    
+    params = {"receive_id_type": "chat_id"}
+    resp = requests.post(url, headers=headers, json=payload, params=params).json()
+    print(f"=== 发送回复: {content} ===")
+    print(f"=== 回复结果: {resp} ===")
+    return resp
+
+
 def get_user_access_token():
     """从文件读取用户访问令牌"""
     try:
@@ -45,9 +74,10 @@ def save_user_tokens(access_token, refresh_token=None):
 @app.get("/authorize")
 def authorize():
     """生成飞书授权 URL"""
-    redirect_uri = "http://localhost:8000/callback"
+    redirect_uri = os.getenv("FEISHU_REDIRECT_URI", "http://localhost:8000/callback")
     scope = "calendar:calendar:readonly calendar:calendar.event:create calendar:calendar.event:update calendar:calendar.event:delete"
     url = f"https://open.feishu.cn/open-apis/authen/v1/authorize?app_id={FEISHU_APP_ID}&redirect_uri={requests.utils.quote(redirect_uri)}&scope={requests.utils.quote(scope)}"
+    print(f"=== 授权URL: {url} ===")
     return {"url": url, "message": "请访问上面的 URL 进行授权，然后告诉我授权后的完整回调 URL"}
 
 
@@ -67,7 +97,21 @@ def delete_token():
 
 @app.get("/callback")
 def callback(code: str = None, redirect_uri: str = None):
-    """处理飞书授权回调"""
+    """处理飞书授权回调 - 本地版本"""
+    return handle_callback(code, redirect_uri)
+
+
+@app.get("/render_callback")
+def render_callback(code: str = None, redirect_uri: str = None):
+    """处理飞书授权回调 - Render版本，显示成功页面"""
+    result = handle_callback(code, redirect_uri)
+    if result.get("code") == 0:
+        return {"success": True, "message": "授权成功！可以关闭此页面了。"}
+    return result
+
+
+def handle_callback(code: str = None, redirect_uri: str = None):
+    """处理飞书授权回调 - 通用逻辑"""
     if not code:
         return {"error": "缺少授权码"}
     
@@ -689,6 +733,7 @@ async def handle_event(event_data: FeishuEvent):
         text = content_json.get("text", "")
         text = text.replace('\\n', '\n')
         print(f"=== 提取的text: {repr(text)} ===")
+        chat_id = message.get("chat_id")
 
         try:
             # 先检查是否是删除意图
@@ -714,6 +759,7 @@ async def handle_event(event_data: FeishuEvent):
                 for evt in events:
                     delete_feishu_event(evt['event_id'], evt['calendar_id'])
                     deleted_count += 1
+                send_feishu_reply(chat_id, message.get("message_id"), f"✨ 好嘞！已经帮你清理掉 {deleted_count} 个日程啦，干干净净~")
                 return {"code": 0, "msg": f"已删除 {deleted_count} 个日程"}
             
             # 检查是否是修改意图
@@ -733,6 +779,7 @@ async def handle_event(event_data: FeishuEvent):
                             start_time=new_schedules[0].get('start_time'),
                             end_time=new_schedules[0].get('end_time')
                         )
+                        send_feishu_reply(chat_id, message.get("message_id"), "📝 收到！正在帮你修改日程，稍等一下下~")
                         return {"code": 0, "msg": "日程已修改"}
                 return {"code": 0, "msg": "未找到需要修改的日程"}
             
@@ -754,6 +801,7 @@ async def handle_event(event_data: FeishuEvent):
                     )
                     if dingtalk_res.get("errcode") == 0:
                         dingtalk_count += 1
+                send_feishu_reply(chat_id, message.get("message_id"), f"🌟 搞定啦！一口气帮你创建了 {len(schedules)} 个日程，其中飞书 {feishu_count} 个，钉钉 {dingtalk_count} 个~记得查看哦！")
                 return {"code": 0, "msg": f"已创建 {len(schedules)} 个日程 (飞书{feishu_count}个, 钉钉{dingtalk_count}个)"}
             elif len(schedules) == 1:
                 schedule = schedules[0]
@@ -763,6 +811,8 @@ async def handle_event(event_data: FeishuEvent):
                 dingtalk_res = create_dingtalk_event(
                     schedule["title"], schedule["start_time"], schedule["end_time"]
                 )
+                time_str = schedule["start_time"].strftime("%m月%d日 %H:%M") if schedule["start_time"] else ""
+                send_feishu_reply(chat_id, message.get("message_id"), f"收到！日程 {schedule['title']} 已经安排好啦~ {time_str} 记得准时哦！")
                 return {"code": 0, "msg": "日程已创建"}
             else:
                 info = extract_schedule_info(text)
@@ -774,9 +824,12 @@ async def handle_event(event_data: FeishuEvent):
                     dingtalk_res = create_dingtalk_event(
                         info["title"], info["start_time"], info["end_time"]
                     )
+                    time_str = info["start_time"].strftime("%m月%d日 %H:%M") if info.get("start_time") else ""
+                    send_feishu_reply(chat_id, message.get("message_id"), f"收到！日程 {info['title']} 已经安排好啦~ {time_str} 记得准时哦！")
                     return {"code": 0, "msg": "日程已创建"}
                 else:
                     print(f"未能解析的原始文本为: {repr(text)}")
+                    send_feishu_reply(chat_id, message.get("message_id"), "🤔 嗯...我好像没看懂你想说什么呢~试试这样跟我说：明天上午10点到12点开会")
         except Exception as e:
             print(f"创建日程失败，异常信息: {e}")
 
