@@ -23,6 +23,119 @@ DINGTALK_APP_SECRET = os.getenv("DINGTALK_APP_SECRET")
 USER_ACCESS_TOKEN_FILE = "user_access_token.txt"
 USER_REFRESH_TOKEN_FILE = "user_refresh_token.txt"
 
+# 消息去重缓存
+processed_messages = set()
+
+
+def extract_colloquial_schedule(text: str):
+    """解析口语化表达，如：'请舍长在今天晚上11点提交人智实验作业'"""
+    # 匹配模式："请XXX在XX时间做XXX"
+    # 例如："请舍长在今天晚上11点提交人智实验作业"
+    # 或："提醒我明天上午9点开会"
+    # 或："今天晚上8点到9点吃饭"
+    
+    time_patterns = [
+        # 今天/明天/后天 + 时间段
+        r'(今天|明天|后天|今天晚上|今天上午|今天下午|明天晚上|明天上午|明天下午|后天晚上|后天上午|后天下午)([0-9零一二三四五六七八九十]{1,2})点?([0-9零一二三四五六七八九十]{0,2})分?到([0-9零一二三四五六七八九十]{1,2})点?([0-9零一二三四五六七八九十]{0,2})分?',
+        # 今天/明天/后天 + 单个时间点
+        r'(今天|明天|后天|今天晚上|今天上午|今天下午|明天晚上|明天上午|明天下午|后天晚上|后天上午|后天下午)([0-9零一二三四五六七八九十]{1,2})点?([0-9零一二三四五六七八九十]{0,2})分?',
+        # 时间段 + 标题（标题在前）
+        r'([0-9零一二三四五六七八九十]{1,2})点?([0-9零一二三四五六七八九十]{0,2})分?到([0-9零一二三四五六七八九十]{1,2})点?([0-9零一二三四五六七八九十]{0,2})分?(.+)',
+    ]
+    
+    chinese_nums = {'零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+    
+    def parse_chinese_num(s):
+        if s in chinese_nums:
+            return chinese_nums[s]
+        try:
+            return int(s)
+        except:
+            return 0
+    
+    def extract_time_part(text):
+        """提取时间部分和剩余文字"""
+        # 查找所有时间表达式
+        time_pattern = r'([0-9零一二三四五六七八九十]{1,2})点?([0-9零一二三四五六七八九十]{0,2})分?'
+        matches = list(re.finditer(time_pattern, text))
+        
+        if len(matches) >= 2:
+            # 有两个时间点（时间段）
+            first_time = matches[0]
+            second_time = matches[1]
+            start_time_str = first_time.group(0)
+            end_time_str = second_time.group(0)
+            # 标题是第二个时间点之后的内容
+            title = text[second_time.end():].strip()
+            return start_time_str, end_time_str, title
+        elif len(matches) == 1:
+            # 只有一个时间点
+            time_match = matches[0]
+            title = text[time_match.end():].strip()
+            return time_match.group(0), None, title
+        return None, None, None
+    
+    def parse_time(time_str, base_date=None):
+        """解析时间字符串"""
+        if base_date is None:
+            base_date = datetime.now()
+        
+        hour = 0
+        minute = 0
+        
+        # 提取数字
+        nums = re.findall(r'[0-9零一二三四五六七八九十]+', time_str)
+        if nums:
+            hour = parse_chinese_num(nums[0])
+            if len(nums) > 1:
+                minute = parse_chinese_num(nums[1])
+        
+        # 判断日期
+        date_words = ['今天', '明天', '后天']
+        period_words = {'上午': False, '下午': True, '晚上': True, '中午': False}
+        
+        target_date = base_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        is_pm = False
+        
+        for word in ['明天', '后天']:
+            if word in time_str:
+                days = 1 if word == '明天' else 2
+                target_date = target_date + timedelta(days=days)
+                break
+        
+        for word, pm in period_words.items():
+            if word in time_str:
+                is_pm = pm
+                if pm and hour < 12:
+                    hour += 12
+                break
+        
+        return target_date.replace(hour=hour, minute=minute)
+    
+    # 尝试多种模式
+    # 模式1: "请XXX在XX时间做XXX" 或 "XX时间做XXX"
+    # 匹配 "今天晚上11点提交人智实验作业"
+    pattern1 = r'([^在]*?)(在|提醒|记得)?(今天|明天|后天|今天晚上|今天上午|今天下午|明天晚上|明天上午|明天下午|后天晚上|后天上午|后天下午)?([0-9零一二三四五六七八九十]{1,2})点?([0-9零一二三四五六七八九十]{0,2})分?(.*)'
+    match1 = re.search(pattern1, text)
+    if match1:
+        prefix = match1.group(1).strip()  # "请舍长"
+        period = match1.group(3) or ""  # "今天晚上"
+        time_part = match1.group(4) + "点" + (match1.group(5) or "") + "分" if match1.group(5) else match1.group(4) + "点"
+        title = match1.group(6).strip()  # "提交人智实验作业"
+        
+        # 清理标题（去掉句尾的语气词等）
+        title = re.sub(r'^[的是过一下呗啊呀嘛呢啦～~。.]+', '', title).strip()
+        
+        if title and len(title) > 0:
+            target_date = parse_time(period + time_part if period else time_part)
+            return {
+                "title": title,
+                "start_time": target_date,
+                "end_time": target_date + timedelta(hours=1)
+            }
+    
+    return None
+
 
 def send_feishu_reply(chat_id: str, message_id: str, content: str):
     """向用户发送回复消息"""
@@ -299,9 +412,9 @@ def extract_single_schedule(title: str, time_text: str):
 
 
 def extract_single_from_mixed(text: str, prev_title=None):
-    """从混合文本中解析日程（时间在前，标题在后，如：明天晚上8点到9点，吃夜宵）"""
+    """从混合文本中解析日程（时间在前，标题在后，如：明天晚上8点到9点，吃夜宵 或 明天上午10点到12点开会）"""
     import re
-    # 匹配 "时间 到 时间，标题" 或 "时间，标题"
+    # 匹配 "时间 到 时间，标题" 或 "时间 到 时间标题" 或 "时间，标题"
     separators = ["到", "至", "-", "~"]
     
     # 判断是否有"晚上"或"下午"
@@ -314,30 +427,41 @@ def extract_single_from_mixed(text: str, prev_title=None):
             start_str = parts[0].strip()
             remaining = parts[1].strip()
             
-            # 提取结束时间（到逗号或句尾）
-            end_part = remaining.split('，')[0].split(',')[0].split('。')[0].strip()
+            # 提取结束时间 - 需要提取时间部分，剩余的是标题
+            # 先提取时间（匹配 "12点" 或 "12点半" 或 "12:30" 等）
+            time_match = re.search(r'^(\d{1,2}):?(\d{0,2})点?', remaining)
+            if time_match:
+                end_part = remaining[:time_match.end()].strip()
+                title = remaining[time_match.end():].strip()
+            else:
+                # 如果没有找到时间，说明整个 remaining 都是标题
+                end_part = None
+                title = remaining
             
-            # 提取标题（逗号后面的部分）
+            # 提取标题（逗号后面的部分优先）
             if '，' in remaining:
                 title = remaining.split('，', 1)[1].strip()
             elif ',' in remaining:
                 title = remaining.split(',', 1)[1].strip()
-            else:
-                # 没有逗号，说明整个文本都是时间格式，不是"时间，标题"格式
-                # 如果有前一行标题，则用前一行标题
-                if prev_title:
-                    title = prev_title
-                else:
-                    # 没有前一行标题，返回None，让外部用其他方式处理
-                    return None
+            
+            # 如果没有标题，使用 prev_title
+            if not title and prev_title:
+                title = prev_title
+            elif not title:
+                continue  # 跳过，没有有效的标题
             
             start_dt = parse_time_text(start_str)
-            # 如果整句话有"晚上/下午"，结束时间也需要加12小时
-            end_dt = parse_time_text(end_part, base_date=start_dt) if start_dt else None
-            if end_dt and is_pm and end_dt.hour < 12:
-                end_dt = end_dt + timedelta(hours=12)
+            if not start_dt:
+                continue
             
-            if start_dt and end_dt:
+            # 如果整句话有"晚上/下午"，结束时间需要加12小时
+            end_dt = None
+            if end_part:
+                end_dt = parse_time_text(end_part, base_date=start_dt)
+                if end_dt and is_pm and end_dt.hour < 12:
+                    end_dt = end_dt + timedelta(hours=12)
+            
+            if end_dt:
                 # 如果结束时间早于开始时间，再加12小时
                 if end_dt <= start_dt:
                     end_dt = end_dt + timedelta(hours=12)
@@ -724,8 +848,18 @@ async def handle_event(event_data: FeishuEvent):
         message = event.get("message")
         print(f"=== message检查: message={message} ===")
         if not message or message.get("message_type") != "text":
-            print(f"=== message类型不匹配: message_type={message.get('message_type') if message else None} ===")
             return {"code": 0}
+        
+        # 消息去重
+        msg_id = message.get("message_id")
+        if msg_id and msg_id in processed_messages:
+            print(f"=== 消息 {msg_id} 已处理过，跳过 ===")
+            return {"code": 0}
+        if msg_id:
+            processed_messages.add(msg_id)
+            # 只保留最近100条消息ID
+            if len(processed_messages) > 100:
+                processed_messages.clear()
 
         content_str = message["content"]
         print(f"=== content原始: {content_str} ===")
@@ -782,6 +916,20 @@ async def handle_event(event_data: FeishuEvent):
                         send_feishu_reply(chat_id, message.get("message_id"), "📝 收到！正在帮你修改日程，稍等一下下~")
                         return {"code": 0, "msg": "日程已修改"}
                 return {"code": 0, "msg": "未找到需要修改的日程"}
+            
+            # 尝试口语化解析（如：请舍长在今天晚上11点提交作业）
+            colloquial = extract_colloquial_schedule(text)
+            if colloquial and colloquial.get("title") and colloquial.get("start_time"):
+                print(f"=== 口语化解析结果: {colloquial} ===")
+                feishu_res = create_feishu_event(
+                    colloquial["title"], colloquial["start_time"], colloquial["end_time"]
+                )
+                dingtalk_res = create_dingtalk_event(
+                    colloquial["title"], colloquial["start_time"], colloquial["end_time"]
+                )
+                time_str = colloquial["start_time"].strftime("%m月%d日 %H:%M") if colloquial.get("start_time") else ""
+                send_feishu_reply(chat_id, message.get("message_id"), f"收到！日程 {colloquial['title']} 已经安排好啦~ {time_str} 记得准时哦！")
+                return {"code": 0, "msg": "日程已创建"}
             
             # 尝试批量解析多个日程
             schedules = extract_multiple_schedules(text)
